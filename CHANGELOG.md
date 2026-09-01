@@ -13,6 +13,16 @@ per-file diff commands.
 
 ## [Unreleased]
 
+### Added
+
+- **Local React web UI** for the tracker, saved jobs, and portal search. `python3
+  tools/web_ui.py` serves a localhost-only API over the same `job_search_tracker.csv`
+  and `seen_jobs.json` files the slash-command workflow already uses; `web/` is a
+  Vite + React app (Home, Search, Jobs, Applications). It does not draft CVs or
+  replace `/apply`. Portal search shells out to the existing CLIs with an argv
+  list (no shell). Security guards now scan every `package.json` in the tree,
+  including `web/`. Pinned by `tests/test_web_ui.py`.
+
 ### Security
 
 - **`settings.json` no longer pre-approves `bun run` on arbitrary files** (#396) - the

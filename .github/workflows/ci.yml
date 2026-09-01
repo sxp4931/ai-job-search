@@ -75,6 +75,21 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python -m unittest discover -s tests -t . -v
 
+  web-ui:
+    name: Web UI build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+
   dependency-review:
     name: Dependency review
     # Requires the repo's Dependency graph, which not every repo (upstream or
@@ -185,8 +200,8 @@ jobs:
   discover-clis:
     # The matrix is discovered, not hardcoded, so a portal CLI added in a fork
     # (the /add-portal path) gets typechecked and tested without the fork
-    # having to edit this workflow - the same reason security-guards globs
-    # .agents/**/package.json instead of naming the shipped portals.
+    # having to edit this workflow. security-guards similarly scans package.json
+    # files rather than naming the shipped portals.
     name: Discover portal CLIs
     runs-on: ubuntu-latest
     outputs:

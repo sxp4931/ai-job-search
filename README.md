@@ -161,6 +161,24 @@ Postings are treated as untrusted input (the workflow follows no instructions em
 
 `/reset` is also available, see [Starting over](#starting-over) below.
 
+## Web UI
+
+A local React dashboard for the tracker, saved jobs, and portal search. It reads and writes the same files as `/scrape`, `/apply`, and `/outcome`. It does **not** draft CVs or cover letters — that stays with `/apply`.
+
+```bash
+python3 tools/web_ui.py          # API on http://127.0.0.1:8765 (localhost only)
+cd web && npm install && npm run dev   # UI on http://localhost:5173
+```
+
+Or build once and serve everything from Python:
+
+```bash
+cd web && npm install && npm run build
+python3 tools/web_ui.py
+```
+
+Details in [`web/README.md`](web/README.md).
+
 ## File structure
 
 ```
@@ -226,7 +244,9 @@ ai-job-search/
 │   ├── security_guards.py             # CI guards: permission allowlist, gitignore rules, manifests
 │   ├── upstream_triage.py             # Sort upstream commits into worth-reviewing vs probably-skip
 │   ├── verify_pdf.py                  # Verify a compiled PDF's page count and extractable text
+│   ├── web_ui.py                      # Local React web UI server (localhost only)
 │   └── README_SALARY_TOOL.md          # Salary tool setup instructions
+├── web/                               # React dashboard (tracker, jobs, portal search)
 ├── job_scraper/                       # Scraper state (seen jobs, results)
 ├── gmail_sync/                        # /gmail-sync state (processed message IDs, last sync date)
 ├── upskill/                           # /upskill report output (markdown reports per run)
