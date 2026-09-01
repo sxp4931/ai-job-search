@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -102,6 +103,34 @@ class TrackerTests(StoreFixture):
             self.store.patch_application("deadbeefdeadbeef", {"status": "applied"})
         self.assertEqual(ctx.exception.status, 404)
 
+    def test_patch_identity_fields_returns_the_rewritten_row(self):
+        created = self._tracker_row(company="Acme", role="Engineer", source="https://ex.com/a")
+        updated = self.store.patch_application(created["id"], {"company": "Renamed"})
+        self.assertEqual(updated["company"], "Renamed")
+        self.assertEqual(updated["role"], "Engineer")
+        follow = self.store.patch_application(updated["id"], {"status": "interview"})
+        self.assertEqual(follow["status"], "interview")
+        self.assertEqual(follow["company"], "Renamed")
+
+    def test_concurrent_creates_keep_every_row(self):
+        errors: list[BaseException] = []
+
+        def worker(n: int) -> None:
+            try:
+                self.store.create_application(
+                    {"company": f"Co{n}", "role": "Engineer", "status": "applied"}
+                )
+            except BaseException as exc:  # noqa: BLE001 - collect any race failure
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.store.read_tracker()), 8)
+
 
 class SummaryTests(StoreFixture):
     def test_drafted_excluded_from_sent_and_funnel_base(self):
@@ -126,6 +155,20 @@ class SummaryTests(StoreFixture):
         )
         summary = self.store.summary()
         self.assertEqual(summary["funnel"]["interview"], 1)
+        self.assertEqual(summary["funnel"]["offer"], 0)
+
+    def test_outcome_offer_checkbox_counts_toward_offer_funnel(self):
+        self._tracker_row(status="withdrawn", company="Acme", role="Engineer")
+        folder = web_ui.archive_folder_name("Acme", "Engineer")
+        _write(
+            self.root / "documents" / "applications" / folder / "outcome.md",
+            "# Outcome\n\n## Interview stages reached\n"
+            "- [x] Phone screen\n- [x] Offer received\n\n## Notes\n- [x] ignored\n",
+        )
+        summary = self.store.summary()
+        self.assertEqual(summary["funnel"]["interview"], 1)
+        self.assertEqual(summary["funnel"]["offer"], 1)
+        self.assertEqual(summary["funnel"]["hired"], 0)
 
     def test_rejection_rate_ignores_withdrawn_and_open_rows(self):
         self._tracker_row(status="rejected", company="A")
@@ -231,6 +274,89 @@ class PortalSearchTests(StoreFixture):
         )
         self.assertIn("--since", argv)
         self.assertIn("--key", argv)
+
+    def test_jobdanmark_jobage_filters_client_side(self):
+        self._install_portal("jobdanmark-search")
+        today = datetime.now(timezone.utc).date()
+        old = (today - timedelta(days=20)).isoformat()
+        recent = (today - timedelta(days=3)).isoformat()
+        runner = MagicMock()
+        runner.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "results": [
+                        {
+                            "title": "Old",
+                            "company": "A",
+                            "date": old,
+                            "url": "https://example.com/old",
+                            "location": "",
+                        },
+                        {
+                            "title": "New",
+                            "company": "B",
+                            "date": recent,
+                            "url": "https://example.com/new",
+                            "location": "",
+                        },
+                        {
+                            "title": "Undated",
+                            "company": "C",
+                            "date": None,
+                            "url": "https://example.com/undated",
+                            "location": "",
+                        },
+                    ]
+                }
+            ),
+            stderr="",
+        )
+        self.store.runner = runner
+        result = self.store.search(
+            "jobdanmark-search", {"query": "python", "jobage": 7, "limit": 20}
+        )
+        titles = [row["title"] for row in result["results"]]
+        self.assertEqual(titles, ["New", "Undated"])
+        argv = runner.call_args.args[0]
+        self.assertNotIn("--jobage", argv)
+        self.assertIn("--text", argv)
+
+    def test_jobnet_jobage_filters_client_side(self):
+        self._install_portal("jobnet-search")
+        today = datetime.now(timezone.utc).date()
+        old = (today - timedelta(days=40)).isoformat()
+        runner = MagicMock()
+        runner.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "results": [
+                        {
+                            "title": "Stale",
+                            "company": "A",
+                            "date": old,
+                            "url": "https://example.com/stale",
+                            "location": "",
+                        },
+                        {
+                            "title": "Fresh",
+                            "company": "B",
+                            "date": today.isoformat(),
+                            "url": "https://example.com/fresh",
+                            "location": "",
+                        },
+                    ]
+                }
+            ),
+            stderr="",
+        )
+        self.store.runner = runner
+        result = self.store.search(
+            "jobnet-search", {"query": "sygeplejerske", "jobage": 14, "limit": 20}
+        )
+        titles = [row["title"] for row in result["results"]]
+        self.assertEqual(titles, ["Fresh"])
 
     def test_search_uses_argv_list_not_shell(self):
         self._install_portal("linkedin-search")

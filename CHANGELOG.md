@@ -23,6 +23,17 @@ per-file diff commands.
   list (no shell). Security guards now scan every `package.json` in the tree,
   including `web/`. Pinned by `tests/test_web_ui.py`.
 
+### Fixed
+
+- **Web UI tracker writes no longer share one `.tmp` file** — mutating requests on
+  `ThreadingHTTPServer` could overlap, so two Track clicks could drop a row or
+  collide on `job_search_tracker.csv.tmp`. Writes now take a lock and use unique
+  temp names. Funnel counts now honour `outcome.md` "Offer received" checkboxes
+  (same history rule as `/html-report`). Portals without a recency flag
+  (Jobdanmark, Jobnet) apply the selected age window to each result's `date`
+  client-side. PATCH of company/role/date/source returns the rewritten row
+  instead of HTTP 500.
+
 ### Security
 
 - **`settings.json` no longer pre-approves `bun run` on arbitrary files** (#396) - the

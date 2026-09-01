@@ -18,10 +18,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, TextIO
 from urllib.parse import parse_qs, unquote, urlparse
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -139,6 +141,92 @@ def row_id(row: dict[str, str], index: int) -> str:
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 
+_STAGE_HEADING = re.compile(r"^## Interview stages reached\s*$", re.M)
+_CHECKED_ITEM = re.compile(r"^- \[[xX]\]\s*(.+?)\s*$", re.M)
+_INTERVIEW_STAGE_LABELS = (
+    "phone screen",
+    "technical interview",
+    "case interview",
+    "final round",
+)
+_OFFER_STAGE_LABEL = "offer received"
+
+
+def parse_outcome_stages(text: str) -> tuple[bool, bool]:
+    """Return (reached_interview, reached_offer) from an outcome.md file.
+
+    Only checkboxes under ``## Interview stages reached`` count, matching
+    /html-report Step 2: history, not just the current tracker status.
+    """
+    heading = _STAGE_HEADING.search(text)
+    if heading is None:
+        section = text
+    else:
+        rest = text[heading.end() :]
+        nxt = re.search(r"^## ", rest, re.M)
+        section = rest[: nxt.start()] if nxt else rest
+    interview = False
+    offer = False
+    for match in _CHECKED_ITEM.finditer(section):
+        label = match.group(1).strip().lower()
+        if label.startswith(_OFFER_STAGE_LABEL):
+            offer = True
+            interview = True
+        elif any(label.startswith(name) for name in _INTERVIEW_STAGE_LABELS):
+            interview = True
+    return interview, offer
+
+
+def parse_jobage_days(payload: dict[str, Any]) -> int | None:
+    jobage = payload.get("jobage")
+    if jobage in (None, "", 0, "0"):
+        return None
+    try:
+        days = int(jobage)
+    except (TypeError, ValueError) as exc:
+        raise ApiError(400, "jobage must be a whole number of days") from exc
+    if days < 1:
+        raise ApiError(400, "jobage must be >= 1")
+    return days
+
+
+def within_jobage(raw_date: Any, days: int, *, today: date | None = None) -> bool:
+    """Keep results whose posted date is within ``days``, or whose date is unknown.
+
+    Matches /scrape Step 1b: drop only dates that parse and are older than the
+    window. A missing date is not inferred as stale.
+    """
+    if raw_date in (None, ""):
+        return True
+    text = str(raw_date).strip()[:10]
+    try:
+        posted = date.fromisoformat(text)
+    except ValueError:
+        return True
+    cutoff = (today or datetime.now(timezone.utc).date()) - timedelta(days=days)
+    return posted >= cutoff
+
+
+def _atomic_write_text(path: Path, write: Callable[[TextIO], None]) -> None:
+    """Write via a unique temp file in the same directory, then replace.
+
+    Unique names stop overlapping handlers from sharing one ``.tmp`` path.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            write(handle)
+        tmp_path.replace(path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def parse_frontmatter(text: str) -> dict[str, Any]:
     if not text.startswith("---"):
         return {}
@@ -174,6 +262,7 @@ class Store:
     def __init__(self, root: Path, runner: Runner | None = None):
         self.root = root
         self.runner = runner or subprocess.run
+        self._lock = threading.RLock()
 
     def tracker_path(self) -> Path:
         return self.root / "job_search_tracker.csv"
@@ -229,8 +318,8 @@ class Store:
                 ):
                     extra.append(key)
         fieldnames.extend(extra)
-        tmp = path.with_suffix(".csv.tmp")
-        with tmp.open("w", newline="", encoding="utf-8") as handle:
+
+        def _write(handle: TextIO) -> None:
             writer = csv.DictWriter(
                 handle,
                 fieldnames=fieldnames,
@@ -240,9 +329,14 @@ class Store:
             writer.writeheader()
             for row in materialised:
                 writer.writerow({key: row.get(key, "") for key in fieldnames})
-        tmp.replace(path)
+
+        _atomic_write_text(path, _write)
 
     def create_application(self, payload: dict[str, Any]) -> dict[str, str]:
+        with self._lock:
+            return self._create_application_unlocked(payload)
+
+    def _create_application_unlocked(self, payload: dict[str, Any]) -> dict[str, str]:
         company = str(payload.get("company") or "").strip()
         role = str(payload.get("role") or "").strip()
         if not company or not role:
@@ -276,48 +370,50 @@ class Store:
         return created
 
     def patch_application(self, app_id: str, payload: dict[str, Any]) -> dict[str, str]:
-        rows = self.read_tracker()
-        match = next((row for row in rows if row["id"] == app_id), None)
-        if match is None:
-            raise ApiError(404, "application not found")
-        writable = {
-            "date",
-            "company",
-            "sector",
-            "role",
-            "role_type",
-            "channel",
-            "status",
-            "contact_person",
-            "fit_rating",
-            "notes",
-            "cv_file",
-            "cover_letter_file",
-            "source",
-            "deadline",
-        }
-        for key, value in payload.items():
-            if key not in writable:
-                continue
-            text = str(value).strip() if value is not None else ""
-            if key == "status":
-                text = normalize_status(text)
-                if text not in CANONICAL_STATUSES:
-                    raise ApiError(400, f"unknown status {text!r}")
-            match[key] = text
-        self.write_tracker(rows)
-        refreshed = self.read_tracker()
-        return next(row for row in refreshed if row["id"] == app_id)
+        with self._lock:
+            rows = self.read_tracker()
+            index = next((i for i, row in enumerate(rows) if row["id"] == app_id), None)
+            if index is None:
+                raise ApiError(404, "application not found")
+            match = rows[index]
+            writable = {
+                "date",
+                "company",
+                "sector",
+                "role",
+                "role_type",
+                "channel",
+                "status",
+                "contact_person",
+                "fit_rating",
+                "notes",
+                "cv_file",
+                "cover_letter_file",
+                "source",
+                "deadline",
+            }
+            for key, value in payload.items():
+                if key not in writable:
+                    continue
+                text = str(value).strip() if value is not None else ""
+                if key == "status":
+                    text = normalize_status(text)
+                    if text not in CANONICAL_STATUSES:
+                        raise ApiError(400, f"unknown status {text!r}")
+                match[key] = text
+            self.write_tracker(rows)
+            # Identity fields feed row_id(); look up by stable index so a
+            # company/role/date/source edit does not 500 after a successful write.
+            return self.read_tracker()[index]
 
-    def _outcome_reached_interview(self, company: str, role: str) -> bool:
+    def _outcome_stages(self, company: str, role: str) -> tuple[bool, bool]:
         folder = archive_folder_name(company, role)
         if not folder:
-            return False
+            return False, False
         path = self.root / "documents" / "applications" / folder / "outcome.md"
         if not path.exists():
-            return False
-        text = path.read_text(encoding="utf-8")
-        return bool(re.search(r"^- \[[xX]\]", text, re.M))
+            return False, False
+        return parse_outcome_stages(path.read_text(encoding="utf-8"))
 
     def summary(self) -> dict[str, Any]:
         rows = self.read_tracker()
@@ -346,15 +442,19 @@ class Store:
             for row in submitted:
                 bucket = row["bucket"]
                 status = row["status_normalized"]
+                interview_hist, offer_hist = self._outcome_stages(row["company"], row["role"])
                 if stage == "applied":
                     count += 1
                 elif stage == "interview":
-                    if bucket in {"Interview", "Offer", "Hired"}:
-                        count += 1
-                    elif self._outcome_reached_interview(row["company"], row["role"]):
+                    if (
+                        bucket in {"Interview", "Offer", "Hired"}
+                        or status == "offer_declined"
+                        or interview_hist
+                        or offer_hist
+                    ):
                         count += 1
                 elif stage == "offer":
-                    if bucket in {"Offer", "Hired"} or status == "offer_declined":
+                    if bucket in {"Offer", "Hired"} or status == "offer_declined" or offer_hist:
                         count += 1
                 elif stage == "hired":
                     if bucket == "Hired":
@@ -461,88 +561,90 @@ class Store:
             for extra_key, extra_val in existing.items():
                 if extra_key != "seen":
                     payload[extra_key] = extra_val
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        tmp.replace(path)
+        payload_text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+        _atomic_write_text(path, lambda handle: handle.write(payload_text))
 
     def save_job(self, payload: dict[str, Any]) -> dict[str, Any]:
-        title = str(payload.get("title") or "").strip()
-        company = str(payload.get("company") or "").strip()
-        url = str(payload.get("url") or "").strip()
-        if not title or not url:
-            raise ApiError(400, "title and url are required")
-        key = url or f"{company}_{title}".lower()
-        jobs = self.read_jobs()
-        existing = next((job for job in jobs if job["key"] == key or job.get("url") == url), None)
-        entry = existing or {"key": key}
-        entry.update(
-            {
-                "title": title,
-                "company": company,
-                "url": url,
-                "first_seen": entry.get("first_seen") or utc_today(),
-                "deadline": payload.get("deadline") if "deadline" in payload else entry.get("deadline"),
-                "posted_date": payload.get("posted_date")
-                if "posted_date" in payload
-                else payload.get("date")
-                if "date" in payload
-                else entry.get("posted_date"),
-                "fit": payload.get("fit") or entry.get("fit") or "",
-                "status": payload.get("status") or entry.get("status") or "new",
-                "portal": payload.get("portal") or entry.get("portal") or "",
-                "source": payload.get("source") or entry.get("source") or "cli",
-                "location": payload.get("location") or entry.get("location") or "",
-            }
-        )
-        if existing is None:
-            jobs.append(entry)
-        self.write_jobs(jobs)
-        return entry
+        with self._lock:
+            title = str(payload.get("title") or "").strip()
+            company = str(payload.get("company") or "").strip()
+            url = str(payload.get("url") or "").strip()
+            if not title or not url:
+                raise ApiError(400, "title and url are required")
+            key = url or f"{company}_{title}".lower()
+            jobs = self.read_jobs()
+            existing = next((job for job in jobs if job["key"] == key or job.get("url") == url), None)
+            entry = existing or {"key": key}
+            entry.update(
+                {
+                    "title": title,
+                    "company": company,
+                    "url": url,
+                    "first_seen": entry.get("first_seen") or utc_today(),
+                    "deadline": payload.get("deadline") if "deadline" in payload else entry.get("deadline"),
+                    "posted_date": payload.get("posted_date")
+                    if "posted_date" in payload
+                    else payload.get("date")
+                    if "date" in payload
+                    else entry.get("posted_date"),
+                    "fit": payload.get("fit") or entry.get("fit") or "",
+                    "status": payload.get("status") or entry.get("status") or "new",
+                    "portal": payload.get("portal") or entry.get("portal") or "",
+                    "source": payload.get("source") or entry.get("source") or "cli",
+                    "location": payload.get("location") or entry.get("location") or "",
+                }
+            )
+            if existing is None:
+                jobs.append(entry)
+            self.write_jobs(jobs)
+            return entry
 
     def patch_job(self, key: str, payload: dict[str, Any]) -> dict[str, Any]:
-        jobs = self.read_jobs()
-        match = next((job for job in jobs if job["key"] == key), None)
-        if match is None:
-            raise ApiError(404, "job not found")
-        for field in ("status", "fit", "deadline", "notes"):
-            if field in payload and payload[field] is not None:
-                match[field] = payload[field]
-        self.write_jobs(jobs)
-        return match
+        with self._lock:
+            jobs = self.read_jobs()
+            match = next((job for job in jobs if job["key"] == key), None)
+            if match is None:
+                raise ApiError(404, "job not found")
+            for field in ("status", "fit", "deadline", "notes"):
+                if field in payload and payload[field] is not None:
+                    match[field] = payload[field]
+            self.write_jobs(jobs)
+            return match
 
     def track_job(self, key: str) -> dict[str, str]:
-        jobs = self.read_jobs()
-        job = next((item for item in jobs if item["key"] == key), None)
-        if job is None:
-            raise ApiError(404, "job not found")
-        company = str(job.get("company") or "").strip() or "Unknown company"
-        role = str(job.get("title") or "").strip() or "Unknown role"
-        source = str(job.get("url") or "")
-        existing = next(
-            (
-                row
-                for row in self.read_tracker()
-                if row["company"].lower() == company.lower()
-                and row["role"].lower() == role.lower()
-            ),
-            None,
-        )
-        if existing:
-            return existing
-        created = self.create_application(
-            {
-                "company": company,
-                "role": role,
-                "source": source,
-                "channel": str(job.get("portal") or "web-ui"),
-                "deadline": job.get("deadline") or "",
-                "status": "drafted",
-                "notes": "Tracked from web UI",
-            }
-        )
-        job["status"] = "tracked"
-        self.write_jobs(jobs)
-        return created
+        with self._lock:
+            jobs = self.read_jobs()
+            job = next((item for item in jobs if item["key"] == key), None)
+            if job is None:
+                raise ApiError(404, "job not found")
+            company = str(job.get("company") or "").strip() or "Unknown company"
+            role = str(job.get("title") or "").strip() or "Unknown role"
+            source = str(job.get("url") or "")
+            existing = next(
+                (
+                    row
+                    for row in self.read_tracker()
+                    if row["company"].lower() == company.lower()
+                    and row["role"].lower() == role.lower()
+                ),
+                None,
+            )
+            if existing:
+                return existing
+            created = self._create_application_unlocked(
+                {
+                    "company": company,
+                    "role": role,
+                    "source": source,
+                    "channel": str(job.get("portal") or "web-ui"),
+                    "deadline": job.get("deadline") or "",
+                    "status": "drafted",
+                    "notes": "Tracked from web UI",
+                }
+            )
+            job["status"] = "tracked"
+            self.write_jobs(jobs)
+            return created
 
     def list_portals(self) -> list[dict[str, Any]]:
         skills_root = self.root / ".agents" / "skills"
@@ -601,14 +703,8 @@ class Store:
             raise ApiError(400, "query is required")
         if location and loc_flag:
             argv.extend([loc_flag, location])
-        jobage = payload.get("jobage")
-        if jobage not in (None, "", 0, "0"):
-            try:
-                days = int(jobage)
-            except (TypeError, ValueError):
-                raise ApiError(400, "jobage must be a whole number of days")
-            if days < 1:
-                raise ApiError(400, "jobage must be >= 1")
+        days = parse_jobage_days(payload)
+        if days is not None:
             flag = JOBAGE_FLAG_BY_PORTAL.get(portal_id)
             if flag == "--since":
                 since = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
@@ -676,6 +772,11 @@ class Store:
                     "raw": item,
                 }
             )
+        days = parse_jobage_days(payload)
+        if days is not None and portal_id not in JOBAGE_FLAG_BY_PORTAL:
+            normalised = [
+                row for row in normalised if within_jobage(row.get("date"), days)
+            ]
         return {
             "portal": portal_id,
             "count": len(normalised),
