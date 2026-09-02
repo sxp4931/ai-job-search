@@ -486,6 +486,231 @@ class HttpServerTests(StoreFixture):
         self.assertEqual(status, 404)
         self.assertIn("error", data)
 
+    def test_documents_and_from_url_via_http(self):
+        status, saved = self._request(
+            "POST",
+            "/api/documents",
+            {
+                "folder": "cv",
+                "name": "resume.pdf",
+                "content_b64": __import__("base64").b64encode(b"%PDF-1.4 hi").decode(),
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(saved["name"], "resume.pdf")
+        status, listing = self._request("GET", "/api/documents")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listing["files"]), 1)
+        status, result = self._request(
+            "POST",
+            "/api/jobs/from-url",
+            {"url": "https://boards.greenhouse.io/acme/jobs/9"},
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "unsupported_host")
+        status, pasted = self._request(
+            "POST",
+            "/api/jobs/from-text",
+            {
+                "company": "Acme",
+                "role": "Engineer",
+                "text": "Build things.",
+                "url": "https://example.com/jobs/9",
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertTrue(pasted["ok"])
+        status, deleted = self._request("DELETE", "/api/documents?folder=cv&name=resume.pdf")
+        self.assertEqual(status, 200)
+        self.assertTrue(deleted["ok"])
+
+
+class UrlImportHelpersTests(unittest.TestCase):
+    def test_first_url_from_messy_paste(self):
+        self.assertEqual(
+            web_ui.first_url("See https://www.linkedin.com/jobs/view/1234567890/ please"),
+            "https://www.linkedin.com/jobs/view/1234567890/",
+        )
+        self.assertEqual(
+            web_ui.first_url("https://jobindex.dk/jobannonce/h1."),
+            "https://jobindex.dk/jobannonce/h1",
+        )
+
+    def test_portal_host_matches_subdomains(self):
+        self.assertEqual(
+            web_ui.portal_for_host("https://dk.linkedin.com/jobs/view/1"),
+            "linkedin-search",
+        )
+        self.assertEqual(
+            web_ui.portal_for_host("https://www.jobindex.dk/jobannonce/h1"),
+            "jobindex-search",
+        )
+        self.assertIsNone(web_ui.portal_for_host("https://boards.greenhouse.io/acme/jobs/1"))
+
+    def test_detail_argument_extracts_portal_ids(self):
+        self.assertEqual(
+            web_ui.detail_argument(
+                "jobbank-search",
+                "https://jobbank.dk/job/12345/acme/data-scientist/",
+            ),
+            "12345",
+        )
+        self.assertEqual(
+            web_ui.detail_argument(
+                "jobnet-search",
+                "https://jobnet.dk/find-job/9ef43bce-d82b-4ea1-a098-7ff6520f99be",
+            ),
+            "9ef43bce-d82b-4ea1-a098-7ff6520f99be",
+        )
+        self.assertEqual(
+            web_ui.detail_argument(
+                "jobdanmark-search",
+                "https://jobdanmark.dk/job/softwareudvikler-til-statens-it",
+            ),
+            "softwareudvikler-til-statens-it",
+        )
+        linkedin = "https://www.linkedin.com/jobs/view/4300011451/"
+        self.assertEqual(web_ui.detail_argument("linkedin-search", linkedin), linkedin)
+
+    def test_normalize_detail_reads_nested_shapes(self):
+        jobnet = web_ui.normalize_detail(
+            "jobnet-search",
+            {
+                "title": "Sygeplejerske",
+                "employer": {"name": "Region Midt"},
+                "job": {"address": {"city": "Aarhus"}},
+                "application": {"deadlineDate": "2026-09-15"},
+                "body": "<p>Hello</p>",
+                "url": "https://jobnet.dk/find-job/abc",
+            },
+            "https://jobnet.dk/find-job/abc",
+        )
+        self.assertEqual(jobnet["company"], "Region Midt")
+        self.assertEqual(jobnet["location"], "Aarhus")
+        self.assertEqual(jobnet["deadline"], "2026-09-15")
+        self.assertEqual(jobnet["description"], "Hello")
+
+        danmark = web_ui.normalize_detail(
+            "jobdanmark-search",
+            {
+                "title": "Udvikler",
+                "hiringOrganization": {"name": "Statens IT"},
+                "jobLocation": {"address": {"addressLocality": "København"}},
+                "validThrough": "2026-10-01T00:00:00",
+                "description": "Build things",
+            },
+            "https://jobdanmark.dk/job/udvikler",
+        )
+        self.assertEqual(danmark["company"], "Statens IT")
+        self.assertEqual(danmark["location"], "København")
+        self.assertEqual(danmark["deadline"], "2026-10-01")
+
+
+class DocumentStoreTests(StoreFixture):
+    def test_save_list_and_delete_cv(self):
+        saved = self.store.save_document("cv", "Ada Resume.pdf", b"%PDF-1.4 fake")
+        self.assertEqual(saved["name"], "Ada Resume.pdf")
+        listing = self.store.list_documents()
+        self.assertEqual(listing["files"][0]["folder"], "cv")
+        self.store.delete_document("cv", "Ada Resume.pdf")
+        self.assertEqual(self.store.list_documents()["files"], [])
+
+    def test_rejects_path_traversal_and_wrong_type(self):
+        with self.assertRaises(web_ui.ApiError) as ctx:
+            self.store.save_document("cv", "../../etc/passwd.pdf", b"%PDF")
+        self.assertEqual(ctx.exception.status, 400)
+        with self.assertRaises(web_ui.ApiError) as ctx:
+            self.store.save_document("cv", "virus.exe", b"MZ")
+        self.assertEqual(ctx.exception.status, 400)
+        with self.assertRaises(web_ui.ApiError):
+            self.store.save_document("secret", "a.pdf", b"%PDF")
+
+    def test_save_posting_text_uses_company_role_name(self):
+        path = self.store.save_posting_text(
+            "Acme", "Engineer", "Build the thing", url="https://example.com/job"
+        )
+        self.assertEqual(path, "documents/postings/Acme - Engineer.txt")
+        text = (self.root / path).read_text(encoding="utf-8")
+        self.assertIn("Source: https://example.com/job", text)
+        self.assertIn("Build the thing", text)
+
+
+class ImportUrlTests(StoreFixture):
+    def _install_portal(self, portal_id: str) -> None:
+        skill = self.root / ".agents" / "skills" / portal_id / "SKILL.md"
+        cli = self.root / ".agents" / "skills" / portal_id / "cli" / "src" / "cli.ts"
+        _write(skill, f"---\nname: {portal_id}\nenabled: true\n---\n\n# {portal_id}\n")
+        _write(cli, "// stub\n")
+
+    def test_unsupported_host_asks_for_paste(self):
+        result = self.store.import_from_url("https://boards.greenhouse.io/acme/jobs/1")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "unsupported_host")
+        self.assertEqual(self.store.read_jobs(), [])
+
+    def test_linkedin_detail_saves_job_and_posting(self):
+        self._install_portal("linkedin-search")
+        runner = MagicMock()
+        runner.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "title": "Engineer",
+                    "company": "Globex",
+                    "location": "Remote",
+                    "url": "https://www.linkedin.com/jobs/view/4300011451",
+                    "description": "Ship the product.",
+                    "datePosted": "2026-08-20",
+                }
+            ),
+            stderr="",
+        )
+        self.store.runner = runner
+        result = self.store.import_from_url(
+            "https://www.linkedin.com/jobs/view/4300011451/",
+            track=True,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["job"]["company"], "Globex")
+        self.assertEqual(result["application"]["status"], "drafted")
+        self.assertTrue(result["posting_file"].endswith("Globex - Engineer.txt"))
+        argv = runner.call_args.args[0]
+        self.assertIsInstance(argv, list)
+        self.assertEqual(argv[1], "run")
+        self.assertIn("detail", argv)
+        self.assertFalse(runner.call_args.kwargs.get("shell"))
+
+    def test_fetch_failure_does_not_save(self):
+        self._install_portal("jobindex-search")
+        runner = MagicMock()
+        runner.return_value = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr=json.dumps({"error": "Job not found", "code": "NOT_FOUND"}),
+        )
+        self.store.runner = runner
+        result = self.store.import_from_url("https://www.jobindex.dk/jobannonce/h999")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "fetch_failed")
+        self.assertEqual(self.store.read_jobs(), [])
+
+    def test_paste_text_saves_posting_and_job(self):
+        result = self.store.import_from_text(
+            {
+                "company": "Acme",
+                "role": "ML Engineer",
+                "text": "We need an ML engineer.",
+                "url": "https://example.com/jobs/1",
+                "track": True,
+            }
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["job"]["title"], "ML Engineer")
+        self.assertEqual(len(self.store.read_tracker()), 1)
+        posting = self.root / "documents" / "postings" / "Acme - ML Engineer.txt"
+        self.assertTrue(posting.exists())
+
 
 class BindTests(unittest.TestCase):
     def test_default_host_is_localhost(self):

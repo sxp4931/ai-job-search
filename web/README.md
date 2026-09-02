@@ -31,7 +31,15 @@ The server binds to localhost only. Your tracker stays on this machine.
 
 ## What each page does
 
-- **Home** — counts, funnel, deadlines
-- **Search** — query an installed portal CLI
-- **Jobs** — saved/scraped postings; Track adds a drafted application
-- **Applications** — edit status on the tracker CSV
+- **Home** — paste a job link or drop a resume, then counts, funnel, and what is due next
+- **Search** — query an installed portal CLI; copy `/apply <url>` for your assistant
+- **Jobs** — saved/scraped/pasted postings; Track adds a drafted application
+- **Applications** — edit status and notes on the tracker CSV
+- **Documents** — `documents/cv`, LinkedIn export, diplomas, references, pasted postings
+
+## Everyday shortcuts
+
+- Paste a job URL on a blank part of the page (not inside a field) to fetch it
+- Drop a PDF/TeX/text file anywhere — resumes go to `documents/cv`, text to `documents/postings`
+- `⌘K` / `Ctrl+K` opens a jump menu
+- Boards that block automated reads fall back to “paste the posting text”

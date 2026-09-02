@@ -1,23 +1,35 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
-import { EmptyState, StatusBadge } from '../components/ui'
+import { CaptureBar } from '../components/Capture'
+import { Banner, Chip, CopyButton, EmptyState, StatusBadge } from '../components/ui'
 import { Link } from '../Link'
 import { statusLabel } from '../status'
+import { useUi } from '../ui-context'
+import { applyCommand, portalLabel, relativeDate } from '../util'
 import type { Job } from '../types'
 
 export function JobsPage() {
+  const { toast, refresh, bump } = useUi()
   const [jobs, setJobs] = useState<Job[]>([])
   const [query, setQuery] = useState('')
   const [fit, setFit] = useState('all')
   const [status, setStatus] = useState('all')
   const [error, setError] = useState('')
-  const [notice, setNotice] = useState('')
 
   const load = () => api.jobs().then(setJobs).catch((err: Error) => setError(err.message))
 
   useEffect(() => {
     void load()
-  }, [])
+  }, [refresh])
+
+  const counts = useMemo(() => {
+    const map: Record<string, number> = { all: jobs.length, new: 0, ranked: 0, tracked: 0, skipped: 0 }
+    for (const job of jobs) {
+      const key = job.status || 'new'
+      map[key] = (map[key] || 0) + 1
+    }
+    return map
+  }, [jobs])
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -31,13 +43,13 @@ export function JobsPage() {
   }, [jobs, query, fit, status])
 
   async function track(job: Job) {
-    setNotice('')
     try {
       await api.trackJob(job.key)
-      setNotice(`Tracked ${job.company} — ${job.title}`)
+      bump()
+      toast(`Tracking ${job.company} · ${job.title}`)
       await load()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not track job')
+      toast(err instanceof Error ? err.message : 'Could not track job', 'err')
     }
   }
 
@@ -48,11 +60,17 @@ export function JobsPage() {
 
   return (
     <div className="flex flex-col gap-5">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight">Saved jobs</h1>
-        <p className="mt-1 text-[var(--muted)]">
-          Jobs from past searches and scrapes. Track one to add it to your applications list.
-        </p>
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <p className="eyebrow">Inbox</p>
+          <h1 className="font-display text-3xl font-bold tracking-tight">Saved jobs</h1>
+          <p className="mt-1 text-[var(--muted)]">
+            From searches, scrapes, and pasted links. Track one to add it to Applications.
+          </p>
+        </div>
+        <div className="w-full max-w-md">
+          <CaptureBar />
+        </div>
       </div>
 
       <div className="flex flex-wrap gap-2">
@@ -68,23 +86,23 @@ export function JobsPage() {
           <option value="medium">Medium</option>
           <option value="low">Low</option>
         </select>
-        <select className="field w-auto" value={status} onChange={(event) => setStatus(event.target.value)}>
-          <option value="all">Any status</option>
-          <option value="new">New</option>
-          <option value="ranked">Ranked</option>
-          <option value="tracked">Tracked</option>
-          <option value="skipped">Skipped</option>
-          <option value="expired">Expired</option>
-        </select>
       </div>
 
-      {error ? <p className="text-red-600">{error}</p> : null}
-      {notice ? <p className="text-[var(--accent-ink)]">{notice}</p> : null}
+      <div className="flex flex-wrap gap-2">
+        {(['all', 'new', 'ranked', 'tracked', 'skipped'] as const).map((value) => (
+          <Chip key={value} active={status === value} onClick={() => setStatus(value)}>
+            {value === 'all' ? 'All' : statusLabel(value)}
+            {typeof counts[value] === 'number' ? ` ${counts[value]}` : ''}
+          </Chip>
+        ))}
+      </div>
+
+      {error ? <Banner tone="err">{error}</Banner> : null}
 
       {jobs.length === 0 ? (
         <EmptyState
           title="No saved jobs yet"
-          body="Run a search and save the ones worth a look. /scrape from your assistant also lands here."
+          body="Paste a posting URL above, run a search, or let /scrape land jobs here."
           action={
             <Link className="btn btn-primary" href="#/search">
               Search now
@@ -98,12 +116,13 @@ export function JobsPage() {
           {filtered.map((job) => (
             <li key={job.key} className="card p-4">
               <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
+                <div className="min-w-0">
                   <p className="font-semibold">{job.title}</p>
                   <p className="text-sm text-[var(--muted)]">
                     {job.company || 'Unknown company'}
                     {job.location ? ` · ${job.location}` : ''}
-                    {job.portal ? ` · ${job.portal.replace(/-search$/, '')}` : ''}
+                    {job.portal ? ` · ${portalLabel(job.portal)}` : ''}
+                    {job.posted_date ? ` · ${relativeDate(job.posted_date)}` : ''}
                   </p>
                   <div className="mt-2 flex flex-wrap gap-2">
                     {job.fit ? <StatusBadge bucket="Active" label={`${job.fit} fit`} /> : null}
@@ -116,8 +135,11 @@ export function JobsPage() {
                 <div className="flex flex-wrap gap-2">
                   {job.url ? (
                     <a className="btn btn-ghost" href={job.url} target="_blank" rel="noreferrer">
-                      Open posting
+                      Open
                     </a>
+                  ) : null}
+                  {job.url?.startsWith('http') ? (
+                    <CopyButton text={applyCommand(job.url)} label="/apply" />
                   ) : null}
                   <button className="btn btn-primary" onClick={() => void track(job)}>
                     Track

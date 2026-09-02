@@ -3,6 +3,8 @@
 
 This is a presentation layer over the files the slash-command workflow already
 uses. It does not draft CVs, score fit, or replace /apply, /rank, or /interview.
+Paste-a-link uses each portal CLI's ``detail`` command; dropped resumes land in
+``documents/``.
 
 Binds to 127.0.0.1 only: the tracker and seen-jobs files are personal data.
 """
@@ -10,6 +12,7 @@ Binds to 127.0.0.1 only: the tracker and seen-jobs files are personal data.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hashlib
 import json
@@ -79,9 +82,38 @@ REQUIRES_LOCATION = frozenset({"linkedin-search"})
 
 PORTAL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
 MAX_BODY = 1_000_000
+MAX_UPLOAD = 12_000_000
+MAX_POSTING_CHARS = 400_000
 SEARCH_TIMEOUT_SEC = 90
+DETAIL_TIMEOUT_SEC = 90
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+
+# Host suffix → portal id. Only used when that portal skill is installed.
+PORTAL_HOST_SUFFIXES = (
+    ("linkedin.com", "linkedin-search"),
+    ("jobindex.dk", "jobindex-search"),
+    ("jobbank.dk", "jobbank-search"),
+    ("jobnet.dk", "jobnet-search"),
+    ("jobdanmark.dk", "jobdanmark-search"),
+    ("freehire.me", "freehire-search"),
+)
+
+DOC_FOLDERS: dict[str, frozenset[str]] = {
+    "cv": frozenset({".pdf", ".tex"}),
+    "linkedin": frozenset({".pdf"}),
+    "diplomas": frozenset({".pdf"}),
+    "references": frozenset({".pdf", ".txt", ".md"}),
+    "postings": frozenset({".txt", ".md"}),
+}
+
+URL_IN_TEXT = re.compile(r"https?://[^\s<>\"')\]]+", re.I)
+FILE_TYPES = {
+    ".pdf": "application/pdf",
+    ".tex": "text/plain; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+}
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -205,6 +237,168 @@ def within_jobage(raw_date: Any, days: int, *, today: date | None = None) -> boo
         return True
     cutoff = (today or datetime.now(timezone.utc).date()) - timedelta(days=days)
     return posted >= cutoff
+
+
+def first_url(text: str) -> str:
+    """Pull the first http(s) URL out of pasted text (or the whole string)."""
+    raw = (text or "").strip()
+    if not raw:
+        raise ApiError(400, "url is required")
+    if re.match(r"^https?://", raw, re.I):
+        candidate = raw.split()[0]
+    else:
+        match = URL_IN_TEXT.search(raw)
+        if match is None:
+            raise ApiError(400, "no URL found in that text")
+        candidate = match.group(0)
+    return candidate.rstrip(".,);]")
+
+
+def portal_for_host(url: str) -> str | None:
+    host = (urlparse(url).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    for suffix, portal_id in PORTAL_HOST_SUFFIXES:
+        if host == suffix or host.endswith("." + suffix):
+            return portal_id
+    return None
+
+
+def detail_argument(portal_id: str, url: str) -> str:
+    """Map a browser URL to the argument each portal's detail command expects."""
+    path = urlparse(url).path.rstrip("/")
+    if portal_id == "jobbank-search":
+        match = re.search(r"/job/(\d+)", path)
+        return match.group(1) if match else url
+    if portal_id == "jobnet-search":
+        match = re.search(r"/find-job/([^/]+)", path) or re.search(r"/job/([^/]+)", path)
+        return match.group(1) if match else url
+    if portal_id == "jobdanmark-search":
+        match = re.search(r"/job/([^/]+)", path)
+        return match.group(1) if match else url
+    return url
+
+
+def _as_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value)
+    return ""
+
+
+def _plain_text(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
+def normalize_detail(portal_id: str, data: dict[str, Any], fallback_url: str) -> dict[str, str]:
+    employer = data.get("employer") if isinstance(data.get("employer"), dict) else {}
+    hiring = data.get("hiringOrganization") if isinstance(data.get("hiringOrganization"), dict) else {}
+    application = data.get("application") if isinstance(data.get("application"), dict) else {}
+    job = data.get("job") if isinstance(data.get("job"), dict) else {}
+    address = job.get("address") if isinstance(job.get("address"), dict) else {}
+    loc = data.get("jobLocation") if isinstance(data.get("jobLocation"), dict) else {}
+    loc_addr = loc.get("address") if isinstance(loc.get("address"), dict) else loc
+
+    def loc_field(key: str) -> str:
+        if isinstance(loc_addr, dict):
+            return _as_str(loc_addr.get(key))
+        return ""
+
+    title = _as_str(data.get("title"))
+    company = (
+        _as_str(data.get("company"))
+        or _as_str(employer.get("name"))
+        or _as_str(hiring.get("name"))
+    )
+    location = (
+        _as_str(data.get("location"))
+        or _as_str(address.get("city"))
+        or loc_field("addressLocality")
+        or _as_str(loc.get("streetAddress") if isinstance(loc, dict) else "")
+    )
+    url = _as_str(data.get("url")) or fallback_url
+    deadline = (
+        _as_str(data.get("deadline"))
+        or _as_str(data.get("validThrough"))
+        or _as_str(application.get("deadlineDate"))
+    )[:10]
+    posted = (
+        _as_str(data.get("date"))
+        or _as_str(data.get("datePosted"))
+        or _as_str(data.get("publicationDateTime"))
+        or _as_str(data.get("posted_date"))
+    )[:10]
+    description = _plain_text(_as_str(data.get("description")) or _as_str(data.get("body")))
+    job_id = _as_str(data.get("id")) or _as_str(data.get("slug"))
+    if not title:
+        raise ApiError(502, "portal detail did not include a job title")
+    return {
+        "id": job_id,
+        "title": title,
+        "company": company,
+        "location": location,
+        "url": url,
+        "deadline": deadline,
+        "date": posted,
+        "description": description,
+        "portal": portal_id,
+    }
+
+
+def safe_filename(name: str) -> str:
+    raw = name or ""
+    if "/" in raw.replace("\\", "/"):
+        raise ApiError(400, "filename cannot include a path")
+    base = Path(raw).name
+    cleaned = "".join(ch for ch in base if ch.isalnum() or ch in "._- ()[]").strip(" .")
+    if not cleaned or cleaned in {".", ".."}:
+        raise ApiError(400, "invalid filename")
+    if len(cleaned) > 180:
+        stem = Path(cleaned).stem[:160]
+        suffix = Path(cleaned).suffix[:20]
+        cleaned = f"{stem}{suffix}".strip(" .")
+        if not cleaned:
+            raise ApiError(400, "invalid filename")
+    return cleaned
+
+
+def decode_b64(raw: str) -> bytes:
+    text = (raw or "").strip()
+    if not text:
+        raise ApiError(400, "file content is required")
+    if "," in text and text.lower().startswith("data:"):
+        text = text.split(",", 1)[1]
+    try:
+        data = base64.b64decode(text, validate=False)
+    except Exception as exc:
+        raise ApiError(400, "invalid file encoding") from exc
+    if not data:
+        raise ApiError(400, "file is empty")
+    if len(data) > MAX_UPLOAD:
+        raise ApiError(413, "file is too large (12 MB max)")
+    return data
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        tmp_path.replace(path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _atomic_write_text(path: Path, write: Callable[[TextIO], None]) -> None:
@@ -508,6 +702,20 @@ class Store:
                 }
             )
         deadlines.sort(key=lambda item: item["deadline"])
+        jobs = self.read_jobs()
+        hidden = {"tracked", "skipped", "expired"}
+        untracked = [
+            {
+                "key": job.get("key"),
+                "title": job.get("title") or "",
+                "company": job.get("company") or "",
+                "url": job.get("url") or "",
+                "fit": job.get("fit") or "",
+                "status": job.get("status") or "new",
+            }
+            for job in jobs
+            if (job.get("status") or "new") not in hidden
+        ]
         return {
             "total_rows": len(rows),
             "sent": len(submitted),
@@ -525,6 +733,9 @@ class Store:
                 key=lambda row: (row.get("date") or "", row.get("company") or ""),
                 reverse=True,
             )[:8],
+            "jobs_count": len(jobs),
+            "untracked_count": len(untracked),
+            "untracked_jobs": untracked[:6],
         }
 
     def read_jobs(self) -> list[dict[str, Any]]:
@@ -783,6 +994,285 @@ class Store:
             "results": normalised,
         }
 
+    def build_detail_argv(self, portal_id: str, url: str) -> list[str]:
+        if not PORTAL_NAME_RE.match(portal_id):
+            raise ApiError(400, "invalid portal id")
+        cli = self.root / ".agents" / "skills" / portal_id / "cli" / "src" / "cli.ts"
+        if not cli.exists():
+            raise ApiError(404, f"portal {portal_id} is not installed")
+        bun = shutil.which("bun") or "bun"
+        arg = detail_argument(portal_id, url)
+        if not arg:
+            raise ApiError(400, "could not read a job id from that URL")
+        return [bun, "run", str(cli), "detail", arg, "--format", "json"]
+
+    def import_from_url(self, raw: str, *, track: bool = False) -> dict[str, Any]:
+        url = first_url(raw)
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ApiError(400, "that does not look like a web URL")
+        portal_id = portal_for_host(url)
+        if portal_id is None:
+            return {
+                "ok": False,
+                "reason": "unsupported_host",
+                "url": url,
+                "message": (
+                    "This site is not a built-in job board. Paste the posting text "
+                    "and we will save it under documents/postings."
+                ),
+            }
+        installed = {item["id"] for item in self.list_portals()}
+        if portal_id not in installed:
+            return {
+                "ok": False,
+                "reason": "portal_missing",
+                "url": url,
+                "portal": portal_id,
+                "message": f"{portal_id} is not installed in this checkout.",
+            }
+        if self.runner is subprocess.run and shutil.which("bun") is None:
+            raise ApiError(503, "bun is not installed — the portal CLIs need bun")
+        argv = self.build_detail_argv(portal_id, url)
+        try:
+            completed = self.runner(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=DETAIL_TIMEOUT_SEC,
+                cwd=str(self.root),
+            )
+        except FileNotFoundError as exc:
+            raise ApiError(503, f"could not run portal CLI: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ApiError(504, "looking up that posting timed out") from exc
+        if completed.returncode != 0:
+            err = (completed.stderr or completed.stdout or "").strip()
+            message = err or f"{portal_id} could not open that posting"
+            try:
+                parsed_err = json.loads(err)
+                if isinstance(parsed_err, dict) and parsed_err.get("error"):
+                    message = str(parsed_err["error"])
+            except json.JSONDecodeError:
+                pass
+            return {
+                "ok": False,
+                "reason": "fetch_failed",
+                "url": url,
+                "portal": portal_id,
+                "message": (
+                    f"{message} Paste the posting text instead — many boards block automated reads."
+                ),
+            }
+        try:
+            payload = json.loads(completed.stdout or "")
+        except json.JSONDecodeError:
+            return {
+                "ok": False,
+                "reason": "fetch_failed",
+                "url": url,
+                "portal": portal_id,
+                "message": "The board replied, but not as JSON. Paste the posting text instead.",
+            }
+        if not isinstance(payload, dict):
+            return {
+                "ok": False,
+                "reason": "fetch_failed",
+                "url": url,
+                "portal": portal_id,
+                "message": "Unexpected detail response. Paste the posting text instead.",
+            }
+        detail = normalize_detail(portal_id, payload, url)
+        warning = next(
+            (
+                item.get("personal_use_warning")
+                for item in self.list_portals()
+                if item["id"] == portal_id
+            ),
+            False,
+        )
+        job = self.save_job(
+            {
+                "title": detail["title"],
+                "company": detail["company"],
+                "url": detail["url"] or url,
+                "location": detail["location"],
+                "date": detail["date"],
+                "deadline": detail["deadline"],
+                "portal": portal_id,
+                "status": "new",
+                "source": "url",
+            }
+        )
+        posting_path = ""
+        if detail["description"]:
+            posting_path = self.save_posting_text(
+                detail["company"] or "Unknown",
+                detail["title"],
+                detail["description"],
+                url=detail["url"] or url,
+            )
+        application = None
+        if track:
+            application = self.track_job(str(job["key"]))
+        return {
+            "ok": True,
+            "reason": "saved",
+            "url": detail["url"] or url,
+            "portal": portal_id,
+            "job": job,
+            "application": application,
+            "posting_file": posting_path,
+            "personal_use_warning": bool(warning),
+            "excerpt": detail["description"][:600],
+        }
+
+    def save_posting_text(
+        self, company: str, role: str, text: str, url: str = ""
+    ) -> str:
+        body = (text or "").strip()
+        if not body:
+            raise ApiError(400, "posting text is required")
+        if len(body) > MAX_POSTING_CHARS:
+            raise ApiError(413, "posting text is too long")
+        company = (company or "").strip() or "Unknown"
+        role = (role or "").strip() or "Role"
+        name = safe_filename(f"{company} - {role}.txt")
+        if not name.lower().endswith(".txt"):
+            name = f"{name}.txt"
+        folder = self.root / "documents" / "postings"
+        path = folder / name
+        header = f"Source: {url.strip()}\n\n" if url.strip() else ""
+        payload = header + body + ("" if body.endswith("\n") else "\n")
+        _atomic_write_bytes(path, payload.encode("utf-8"))
+        return f"documents/postings/{name}"
+
+    def import_from_text(self, payload: dict[str, Any]) -> dict[str, Any]:
+        company = str(payload.get("company") or "").strip()
+        role = str(payload.get("role") or "").strip()
+        text = str(payload.get("text") or "").strip()
+        url = str(payload.get("url") or payload.get("source") or "").strip()
+        if url and not urlparse(url).scheme:
+            url = ""
+        if not company or not role:
+            raise ApiError(400, "company and role are required")
+        if not text:
+            raise ApiError(400, "posting text is required")
+        posting_file = self.save_posting_text(company, role, text, url=url)
+        job_url = url or f"file:{posting_file}"
+        job = self.save_job(
+            {
+                "title": role,
+                "company": company,
+                "url": job_url,
+                "deadline": str(payload.get("deadline") or "").strip(),
+                "portal": str(payload.get("portal") or "").strip(),
+                "status": "new",
+                "source": "paste",
+                "location": str(payload.get("location") or "").strip(),
+            }
+        )
+        application = None
+        if payload.get("track"):
+            application = self.track_job(str(job["key"]))
+        return {
+            "ok": True,
+            "reason": "saved",
+            "job": job,
+            "application": application,
+            "posting_file": posting_file,
+        }
+
+    def _doc_dir(self, folder: str) -> Path:
+        if folder not in DOC_FOLDERS:
+            raise ApiError(400, f"unknown documents folder {folder!r}")
+        path = (self.root / "documents" / folder).resolve()
+        try:
+            path.relative_to((self.root / "documents").resolve())
+        except ValueError as exc:
+            raise ApiError(400, "invalid folder") from exc
+        return path
+
+    def _doc_path(self, folder: str, name: str) -> Path:
+        if folder not in DOC_FOLDERS:
+            raise ApiError(400, f"unknown documents folder {folder!r}")
+        filename = safe_filename(name)
+        suffix = Path(filename).suffix.lower()
+        allowed = DOC_FOLDERS[folder]
+        if suffix not in allowed:
+            pretty = ", ".join(sorted(allowed))
+            raise ApiError(400, f"{folder} only accepts {pretty}")
+        folder_path = self._doc_dir(folder)
+        path = (folder_path / filename).resolve()
+        try:
+            path.relative_to(folder_path)
+        except ValueError as exc:
+            raise ApiError(400, "invalid filename") from exc
+        return path
+
+    def list_documents(self) -> dict[str, Any]:
+        files: list[dict[str, Any]] = []
+        for folder in DOC_FOLDERS:
+            directory = self.root / "documents" / folder
+            if not directory.is_dir():
+                continue
+            for path in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
+                if not path.is_file() or path.name.startswith("."):
+                    continue
+                suffix = path.suffix.lower()
+                if suffix not in DOC_FOLDERS[folder]:
+                    continue
+                stat = path.stat()
+                files.append(
+                    {
+                        "folder": folder,
+                        "name": path.name,
+                        "size": stat.st_size,
+                        "modified": datetime.fromtimestamp(
+                            stat.st_mtime, tz=timezone.utc
+                        ).isoformat(),
+                    }
+                )
+        archives: list[dict[str, Any]] = []
+        apps_root = self.root / "documents" / "applications"
+        if apps_root.is_dir():
+            for folder in sorted(apps_root.iterdir(), key=lambda p: p.name.lower()):
+                if not folder.is_dir() or folder.name.startswith("."):
+                    continue
+                archives.append(
+                    {
+                        "folder": folder.name,
+                        "files": sorted(
+                            p.name for p in folder.iterdir() if p.is_file() and not p.name.startswith(".")
+                        ),
+                    }
+                )
+        return {"files": files, "archives": archives}
+
+    def save_document(self, folder: str, name: str, data: bytes) -> dict[str, Any]:
+        path = self._doc_path(folder, name)
+        _atomic_write_bytes(path, data)
+        stat = path.stat()
+        return {
+            "folder": folder,
+            "name": path.name,
+            "size": stat.st_size,
+            "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        }
+
+    def delete_document(self, folder: str, name: str) -> None:
+        path = self._doc_path(folder, name)
+        if not path.is_file():
+            raise ApiError(404, "file not found")
+        path.unlink()
+
+    def read_document(self, folder: str, name: str) -> tuple[bytes, str, str]:
+        path = self._doc_path(folder, name)
+        if not path.is_file():
+            raise ApiError(404, "file not found")
+        ctype = FILE_TYPES.get(path.suffix.lower(), "application/octet-stream")
+        return path.read_bytes(), ctype, path.name
+
     def profile(self) -> dict[str, Any]:
         path = self.root / "CLAUDE.md"
         if not path.exists():
@@ -817,9 +1307,9 @@ def _send(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
     handler.wfile.write(body)
 
 
-def _read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
+def _read_json(handler: BaseHTTPRequestHandler, max_bytes: int = MAX_BODY) -> dict[str, Any]:
     length = int(handler.headers.get("Content-Length") or "0")
-    if length > MAX_BODY:
+    if length > max_bytes:
         raise ApiError(413, "request too large")
     raw = handler.rfile.read(length) if length else b"{}"
     if not raw:
@@ -880,6 +1370,9 @@ def make_handler(store: Store, dist: Path) -> type[BaseHTTPRequestHandler]:
 
         def do_PATCH(self) -> None:  # noqa: N802
             self._dispatch("PATCH")
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._dispatch("DELETE")
 
         def _dispatch(self, method: str) -> None:
             parsed = urlparse(self.path)
@@ -970,6 +1463,52 @@ def make_handler(store: Store, dist: Path) -> type[BaseHTTPRequestHandler]:
                 if not portal_id:
                     raise ApiError(400, "portal is required")
                 _send(self, 200, store.search(portal_id, payload))
+                return
+            if path == "/api/jobs/from-url" and method == "POST":
+                payload = _read_json(self)
+                raw = str(payload.get("url") or payload.get("text") or "")
+                track = bool(payload.get("track"))
+                result = store.import_from_url(raw, track=track)
+                _send(self, 200, result)
+                return
+            if path == "/api/jobs/from-text" and method == "POST":
+                created = store.import_from_text(_read_json(self))
+                _send(self, 201, created)
+                return
+            if path == "/api/documents" and method == "GET":
+                _send(self, 200, store.list_documents())
+                return
+            if path == "/api/documents" and method == "POST":
+                payload = _read_json(self, max_bytes=MAX_UPLOAD * 2)
+                folder = str(payload.get("folder") or "").strip()
+                name = str(payload.get("name") or "").strip()
+                saved = store.save_document(folder, name, decode_b64(str(payload.get("content_b64") or "")))
+                _send(self, 201, saved)
+                return
+            if path == "/api/documents" and method == "DELETE":
+                folder = (query.get("folder") or [""])[0].strip()
+                name = (query.get("name") or [""])[0].strip()
+                if not folder or not name:
+                    raise ApiError(400, "folder and name are required")
+                store.delete_document(folder, name)
+                _send(self, 200, {"ok": True})
+                return
+            if path == "/api/documents/file" and method == "GET":
+                folder = (query.get("folder") or [""])[0].strip()
+                name = (query.get("name") or [""])[0].strip()
+                if not folder or not name:
+                    raise ApiError(400, "folder and name are required")
+                data, ctype, filename = store.read_document(folder, name)
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header(
+                    "Content-Disposition",
+                    f'inline; filename="{filename}"',
+                )
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
                 return
             raise ApiError(404, "not found")
 

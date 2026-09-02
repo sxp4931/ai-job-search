@@ -18,10 +18,17 @@ per-file diff commands.
 - **Local React web UI** for the tracker, saved jobs, and portal search. `python3
   tools/web_ui.py` serves a localhost-only API over the same `job_search_tracker.csv`
   and `seen_jobs.json` files the slash-command workflow already uses; `web/` is a
-  Vite + React app (Home, Search, Jobs, Applications). It does not draft CVs or
-  replace `/apply`. Portal search shells out to the existing CLIs with an argv
-  list (no shell). Security guards now scan every `package.json` in the tree,
+  Vite + React app (Home, Search, Jobs, Applications, Documents). It does not draft
+  CVs or replace `/apply`. Portal search shells out to the existing CLIs with an
+  argv list (no shell). Security guards now scan every `package.json` in the tree,
   including `web/`. Pinned by `tests/test_web_ui.py`.
+- **Web UI paste-a-link and document drop.** Home accepts a job URL (or a URL
+  pasted onto a blank page, or dragged from the browser). Built-in portal hosts
+  run that portal's `detail` command; if the board is unknown or blocks the
+  fetch, you paste the posting text into `documents/postings/`. Dropped resumes
+  and LinkedIn PDFs land in `documents/` (same folders `/setup` already reads).
+  Applications open in a side panel for notes, deadline, and a copyable `/apply`
+  command. ⌘K jumps between pages. Still localhost-only.
 
 ### Fixed
 

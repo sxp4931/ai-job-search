@@ -163,7 +163,7 @@ Postings are treated as untrusted input (the workflow follows no instructions em
 
 ## Web UI
 
-A local React dashboard for the tracker, saved jobs, and portal search. It reads and writes the same files as `/scrape`, `/apply`, and `/outcome`. It does **not** draft CVs or cover letters — that stays with `/apply`.
+A local React dashboard for the tracker, saved jobs, portal search, and your `documents/` folder. Paste a job URL or drop a resume onto the page. It reads and writes the same files as `/scrape`, `/apply`, and `/outcome`. It does **not** draft CVs or cover letters — that stays with `/apply`.
 
 ```bash
 python3 tools/web_ui.py          # API on http://127.0.0.1:8765 (localhost only)
@@ -246,7 +246,7 @@ ai-job-search/
 │   ├── verify_pdf.py                  # Verify a compiled PDF's page count and extractable text
 │   ├── web_ui.py                      # Local React web UI server (localhost only)
 │   └── README_SALARY_TOOL.md          # Salary tool setup instructions
-├── web/                               # React dashboard (tracker, jobs, portal search)
+├── web/                               # React dashboard (tracker, jobs, search, documents)
 ├── job_scraper/                       # Scraper state (seen jobs, results)
 ├── gmail_sync/                        # /gmail-sync state (processed message IDs, last sync date)
 ├── upskill/                           # /upskill report output (markdown reports per run)
