@@ -415,6 +415,18 @@ class ManifestGuardTests(GuardRepoFixture):
         self.assertEqual(result.returncode, 1)
         self.assertIn("no package.json files found", result.stdout)
 
+    def test_web_package_lifecycle_script_fails(self):
+        web = self.root / "web" / "package.json"
+        web.parent.mkdir(parents=True)
+        self.write_manifest(
+            {"name": "ai-job-search-web", "scripts": {"postinstall": "echo test"}},
+            path=web,
+        )
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("lifecycle script", result.stdout)
+        self.assertIn("web/package.json", result.stdout.replace("\\", "/"))
+
 
 class RealRepoTests(unittest.TestCase):
     def test_guards_pass_on_this_repo(self):

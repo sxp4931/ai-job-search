@@ -20,9 +20,10 @@ Checks:
    and no un-allowlisted negation (!pattern) may re-include them. Catches
    weakening that would make future users silently commit their tracker,
    profile exports, or application archives.
-3. .agents/**/package.json — no npm/bun lifecycle scripts (preinstall,
-   install, postinstall, prepare, prepack) and no trustedDependencies.
-   Catches code execution smuggled into `bun install`.
+3. package.json files (portal CLIs under .agents, plus web/) — no npm/bun
+   lifecycle scripts (preinstall, install, postinstall, prepare, prepack) and no
+   trustedDependencies. Catches code execution smuggled into `bun install` or
+   `npm install`.
 
 Stdlib only. Exit 0 on success, 1 with a failure list otherwise.
 """
@@ -239,10 +240,12 @@ def check_gitignore() -> None:
 
 def check_package_manifests() -> None:
     manifests = [
-        p for p in ROOT.glob(".agents/**/package.json") if "node_modules" not in p.parts
+        p
+        for p in ROOT.glob("**/package.json")
+        if "node_modules" not in p.parts
     ]
     if not manifests:
-        errors.append(".agents: no package.json files found - glob roots are wrong or the tree moved")
+        errors.append("no package.json files found - glob roots are wrong or the tree moved")
     for manifest in manifests:
         relpath = manifest.relative_to(ROOT)
         try:
