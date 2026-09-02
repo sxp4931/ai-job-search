@@ -37,6 +37,15 @@ export interface Application {
   deadline: string
 }
 
+export interface UntrackedJob {
+  key: string
+  title: string
+  company: string
+  url: string
+  fit: string
+  status: string
+}
+
 export interface Summary {
   total_rows: number
   sent: number
@@ -59,6 +68,9 @@ export interface Summary {
     status: string
   }>
   recent: Application[]
+  jobs_count: number
+  untracked_count: number
+  untracked_jobs: UntrackedJob[]
 }
 
 export interface Job {
@@ -108,4 +120,31 @@ export interface Profile {
   status: string
 }
 
-export type Page = 'home' | 'jobs' | 'search' | 'applications'
+export type DocFolder = 'cv' | 'linkedin' | 'diplomas' | 'references' | 'postings'
+
+export interface DocFile {
+  folder: DocFolder
+  name: string
+  size: number
+  modified: string
+}
+
+export interface DocArchive {
+  folder: string
+  files: string[]
+}
+
+export interface ImportResult {
+  ok: boolean
+  reason: string
+  url?: string
+  portal?: string
+  message?: string
+  job?: Job
+  application?: Application
+  posting_file?: string
+  personal_use_warning?: boolean
+  excerpt?: string
+}
+
+export type Page = 'home' | 'jobs' | 'search' | 'applications' | 'documents'

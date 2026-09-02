@@ -1,4 +1,14 @@
-import type { Application, Job, Portal, Profile, SearchHit, Summary } from './types'
+import type {
+  Application,
+  DocArchive,
+  DocFile,
+  ImportResult,
+  Job,
+  Portal,
+  Profile,
+  SearchHit,
+  Summary,
+} from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -41,6 +51,29 @@ export const api = {
     request<Job>('/api/jobs', { method: 'PATCH', body: JSON.stringify({ key, ...body }) }),
   trackJob: (key: string) =>
     request<Application>('/api/jobs/track', { method: 'POST', body: JSON.stringify({ key }) }),
+  importFromUrl: (url: string, track = false) =>
+    request<ImportResult>('/api/jobs/from-url', {
+      method: 'POST',
+      body: JSON.stringify({ url, track }),
+    }),
+  importFromText: (body: Record<string, string | boolean>) =>
+    request<ImportResult>('/api/jobs/from-text', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  documents: () => request<{ files: DocFile[]; archives: DocArchive[] }>('/api/documents'),
+  uploadDocument: (folder: string, name: string, content_b64: string) =>
+    request<DocFile>('/api/documents', {
+      method: 'POST',
+      body: JSON.stringify({ folder, name, content_b64 }),
+    }),
+  deleteDocument: (folder: string, name: string) =>
+    request<{ ok: boolean }>(
+      `/api/documents?folder=${encodeURIComponent(folder)}&name=${encodeURIComponent(name)}`,
+      { method: 'DELETE' },
+    ),
+  documentHref: (folder: string, name: string) =>
+    `/api/documents/file?folder=${encodeURIComponent(folder)}&name=${encodeURIComponent(name)}`,
   portals: () => request<{ portals: Portal[] }>('/api/portals').then((d) => d.portals),
   search: (body: Record<string, string | number>) =>
     request<{ portal: string; count: number; results: SearchHit[] }>('/api/search', {
