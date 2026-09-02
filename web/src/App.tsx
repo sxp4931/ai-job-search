@@ -59,6 +59,7 @@ export default function App() {
   const [paste, setPaste] = useState<PastePrefill | null>(null)
   const [palette, setPalette] = useState(false)
   const [addRequest, setAddRequest] = useState(0)
+  const [hideSetup, setHideSetup] = useState(() => sessionStorage.getItem('job-ui-hide-setup') === '1')
 
   const toast = useCallback((message: string, kind: ToastKind = 'ok') => {
     const id = Date.now() + Math.random()
@@ -165,7 +166,7 @@ export default function App() {
             <button className="btn btn-ghost self-start" onClick={() => setPalette(true)}>
               <Command className="size-4" />
               Commands
-              <kbd className="kbd">⌘K</kbd>
+              <kbd className="kbd">{typeof navigator !== 'undefined' && navigator.platform.includes('Mac') ? '⌘K' : 'Ctrl+K'}</kbd>
             </button>
             <button
               className="btn btn-ghost self-start"
@@ -179,9 +180,18 @@ export default function App() {
         </aside>
 
         <main className="main-pane">
-          {profile && !profile.ready ? (
-            <p className="banner banner-warn mb-5">
-              Profile still has placeholders. Run /setup in your coding assistant so your name lands here.
+          {profile && !profile.ready && !hideSetup ? (
+            <p className="banner banner-warn mb-5 flex items-start justify-between gap-3">
+              <span>Profile still has placeholders. Run /setup in your coding assistant so your name lands here.</span>
+              <button
+                className="btn btn-ghost px-2 py-1 text-xs"
+                onClick={() => {
+                  sessionStorage.setItem('job-ui-hide-setup', '1')
+                  setHideSetup(true)
+                }}
+              >
+                Hide
+              </button>
             </p>
           ) : null}
           {page === 'home' ? <DashboardPage /> : null}

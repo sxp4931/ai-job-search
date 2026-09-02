@@ -1,8 +1,8 @@
-import { FileUp, Link2, LoaderCircle } from 'lucide-react'
-import { useState, type FormEvent } from 'react'
+import { FileUp, Link2, LoaderCircle, Upload } from 'lucide-react'
+import { useRef, useState, type FormEvent } from 'react'
 import { api } from '../api'
 import { useUi, type PastePrefill } from '../ui-context'
-import { applyCommand, extractUrl } from '../util'
+import { applyCommand, extractUrl, fileToBase64, guessFolder, isDroppableFile } from '../util'
 import { Banner, CopyButton, Modal } from './ui'
 
 export function CaptureBar() {
@@ -36,8 +36,26 @@ export function CaptureBar() {
 }
 
 export function CaptureHero() {
-  const { openCapture, toast } = useUi()
+  const { openCapture, toast, bump } = useUi()
   const [value, setValue] = useState('')
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  async function upload(files: File[]) {
+    const usable = files.filter(isDroppableFile)
+    if (usable.length === 0) {
+      toast('Use a PDF, TeX, or text file', 'err')
+      return
+    }
+    try {
+      for (const file of usable) {
+        await api.uploadDocument(guessFolder(file), file.name, await fileToBase64(file))
+      }
+      bump()
+      toast(usable.length === 1 ? `Saved ${usable[0].name}` : `Saved ${usable.length} files`)
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Could not save file', 'err')
+    }
+  }
 
   return (
     <div className="capture-hero">
@@ -76,6 +94,21 @@ export function CaptureHero() {
         <button className="btn btn-primary" type="submit">
           Fetch posting
         </button>
+        <button className="btn btn-ghost" type="button" onClick={() => fileRef.current?.click()}>
+          <Upload className="size-4" />
+          Resume
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          className="hidden"
+          multiple
+          accept=".pdf,.tex,.txt,.md,application/pdf,text/plain"
+          onChange={(event) => {
+            void upload([...(event.target.files ?? [])])
+            event.target.value = ''
+          }}
+        />
       </form>
     </div>
   )

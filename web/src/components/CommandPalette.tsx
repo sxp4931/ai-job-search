@@ -91,7 +91,7 @@ export function CommandPalette({
           ) : null}
         </ul>
         <p className="border-t border-[var(--line)] px-3 py-2 text-xs text-[var(--muted)]">
-          <kbd className="kbd">⌘</kbd>
+          <kbd className="kbd">{typeof navigator !== 'undefined' && navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}</kbd>
           <kbd className="kbd">K</kbd> anytime · paste a job URL on a blank page
         </p>
       </div>

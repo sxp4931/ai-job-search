@@ -122,8 +122,8 @@ export function SearchPage() {
                 className={`btn ${portalId === item.id ? 'btn-primary' : 'btn-ghost'}`}
                 onClick={() => setPortalId(item.id)}
               >
-                {item.title.replace(/ Search Skill$/i, '').replace(/ Search$/i, '')}
-                {item.enabled ? '' : ' (off in scrape)'}
+                {portalLabel(item.id) || item.title}
+                {item.enabled ? '' : ' · off'}
               </button>
             ))}
           </div>

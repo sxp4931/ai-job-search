@@ -150,10 +150,14 @@ textarea {
 
 @media (min-width: 768px) {
   .sidebar {
+    position: sticky;
+    top: 0;
     display: flex;
     width: 15.5rem;
+    height: 100vh;
     flex-direction: column;
-    gap: 1.5rem;
+    gap: 1.25rem;
+    overflow-y: auto;
     border-right: 1px solid var(--line);
     padding: 1.5rem;
   }
